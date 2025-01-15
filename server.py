@@ -6,7 +6,7 @@ import time
 # =============================================================================
 #                               CONSTANTS
 # =============================================================================
-
+connection_lock = threading.Lock()
 OFFER_MAGIC_COOKIE = 0xabcddcba
 OFFER_MESSAGE_TYPE = 0x2
 REQUEST_MESSAGE_TYPE = 0x3
@@ -52,15 +52,16 @@ def udp_offer_broadcast():
 
 
 def handle_client_tcp(conn, addr):
-    """
-    Handles a single TCP connection with a client.
-    Receives an integer (file size), then returns that many bytes.
-    """
+    with connection_lock:  # Add connection_lock = threading.Lock() at top of file
+        current_conn = threading.active_count()
+
     try:
+        conn.settimeout(30)
         raw_data = conn.recv(1024)
         if not raw_data:
             print(f"{RED}[TCP] Received no data from {addr}, closing.{RESET}")
             return
+
         file_size_str = raw_data.decode(errors='ignore').strip()
         if not file_size_str.isdigit():
             print(f"{RED}[TCP] Invalid file size from {addr}: '{file_size_str}'{RESET}")
@@ -69,10 +70,15 @@ def handle_client_tcp(conn, addr):
         file_size = int(file_size_str)
         print(f"{GREEN}[TCP] {addr} requested {file_size} bytes.{RESET}")
 
-        data = b'A' * file_size  # Mock data
-        conn.sendall(data)
+        chunk_size = 8192
+        bytes_sent = 0
+        while bytes_sent < file_size and not server_shutdown_event.is_set():
+            remaining = file_size - bytes_sent
+            chunk = min(chunk_size, remaining)
+            conn.sendall(b'A' * chunk)
+            bytes_sent += chunk
 
-        print(f"{GREEN}[TCP] Finished sending {file_size} bytes to {addr}.{RESET}")
+        print(f"{GREEN}[TCP] Finished sending {bytes_sent} bytes to {addr}.{RESET}")
 
     except Exception as e:
         print(f"{RED}[TCP Error] with {addr}: {e}{RESET}")
@@ -89,7 +95,7 @@ def tcp_server():
 
     try:
         server_socket.bind(("", TCP_SERVER_PORT))
-        server_socket.listen(5)
+        server_socket.listen(1000)
         server_socket.settimeout(1)
         print(f"{YELLOW}TCP Server started, listening on port {TCP_SERVER_PORT}{RESET}")
 
@@ -113,38 +119,55 @@ def tcp_server():
 
 def handle_client_udp(data, addr, udp_socket):
     """
-    Handles a single UDP request from the client:
-      - (magic_cookie=0xabcddcba, msg_type=0x3, file_size=8 bytes).
-    Replies with multiple payload packets.
+    Fixed UDP handler with proper socket management and error handling
     """
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
     try:
-        if len(data) < 13:
-            print(f"{RED}[UDP] Invalid packet from {addr}, too short.{RESET}")
-            return
+        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
 
-        magic_cookie, msg_type, file_size = struct.unpack('!IBQ', data)
+        # Changed format to match client (!IBQQ)
+        magic_cookie, msg_type, file_size, thread_id = struct.unpack('!IBQQ', data)
         if magic_cookie != OFFER_MAGIC_COOKIE or msg_type != REQUEST_MESSAGE_TYPE:
-            print(f"{RED}[UDP] Ignored packet from {addr}, bad cookie or msg_type.{RESET}")
             return
 
-        print(f"{GREEN}[UDP] {addr} requested {file_size} bytes.{RESET}")
+        print(f"{GREEN}[UDP] {addr} requested {file_size} bytes (thread {thread_id}).{RESET}")
         total_segments = file_size // 1024
+        sent_segments = 0
+
+        client_socket.settimeout(30)
 
         for segment in range(total_segments):
-            payload = struct.pack('!IBQQ',
-                                  OFFER_MAGIC_COOKIE,
-                                  PAYLOAD_MESSAGE_TYPE,
-                                  total_segments,
-                                  segment) + b'A' * 1024
-            udp_socket.sendto(payload, addr)
-            time.sleep(0.0005)  # slightly faster
+            if server_shutdown_event.is_set():
+                break
 
-        print(f"{GREEN}[UDP] Finished sending {total_segments} UDP segments to {addr}.{RESET}")
+            try:
+                # Changed format to match client (!IBQQ)
+                payload = struct.pack('!IBQQ',
+                                    OFFER_MAGIC_COOKIE,
+                                    PAYLOAD_MESSAGE_TYPE,
+                                    total_segments,
+                                    segment)
+                payload += b'A' * (1024 - len(payload))
+
+                client_socket.sendto(payload, addr)
+                sent_segments += 1
+
+                if sent_segments % 50 == 0:
+                    time.sleep(0.01)
+
+            except (socket.error, socket.timeout) as e:
+                print(f"{RED}[UDP] Error sending to {addr}, segment {segment}/{total_segments}: {e}{RESET}")
+                time.sleep(0.05)
+                continue
+
+        print(f"{GREEN}[UDP] Finished sending {sent_segments}/{total_segments} segments to {addr}.{RESET}")
 
     except Exception as e:
         print(f"{RED}[UDP Error] with {addr}: {e}{RESET}")
-    # Do NOT close udp_socket here (it’s shared by the whole server!)
-
+    finally:
+        client_socket.close()
 
 def udp_server():
     """
@@ -174,6 +197,7 @@ def udp_server():
         print(f"{RED}[UDP] Could not bind on port {UDP_SERVER_PORT}: {e}{RESET}")
     finally:
         udp_socket.close()
+
 
 
 # =============================================================================

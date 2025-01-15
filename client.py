@@ -68,145 +68,175 @@ def udp_discover():
     udp_socket.close()
     return None, None, None
 
+def print_progress(identifier, current, total):
+    """
+    Shows a simple progress bar
+    """
+    bar_length = 20
+    fraction = current / total if total > 0 else 1
+    filled = int(bar_length * fraction)
+    bar = '#' * filled + '-' * (bar_length - filled)
+    print(f"\r{CYAN}[{identifier}] [{bar}] {current}/{total}{RESET}", end='', flush=True)
+
 
 def perform_speed_test(server_ip, server_udp_port, server_tcp_port, file_size, tcp_connections, udp_connections):
-    """
-    Spawns threads to do multiple TCP and UDP transfers in parallel.
-    Prints partial progress, calculates average speed, and (for UDP) measures simple jitter.
-    """
-
-    # We'll store partial progress for each connection
-    # Key: thread_id, Value: number of bytes or packets received so far
     progress_dict = {}
     progress_lock = threading.Lock()
 
-    def print_progress(identifier, current, total):
+    def tcp_test(t_id):  # Parameter name updated to t_id
+        retries = 3
+        while retries > 0 and not client_shutdown_event.is_set():
+            tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            start_time = time.time()
+            bytes_received = 0
+            data_buf = b""
+
+            try:
+                tcp_socket.settimeout(10)
+                tcp_socket.connect((server_ip, server_tcp_port))
+                tcp_socket.sendall(f"{file_size}\n".encode())
+
+                chunk_size = 8192
+                while bytes_received < file_size:
+                    chunk = tcp_socket.recv(chunk_size)
+                    if not chunk:
+                        if bytes_received < file_size:
+                            raise ConnectionError("Connection closed prematurely")
+                        break
+                    data_buf += chunk
+                    bytes_received += len(chunk)
+
+                    with progress_lock:
+                        progress_dict[t_id] = bytes_received
+                        print_progress(f"TCP-{t_id}", bytes_received, file_size)
+
+                total_time = time.time() - start_time
+                speed = bytes_received / total_time if total_time > 0 else 0
+                print(
+                    f"\n{GREEN}[TCP-{t_id}] Received {bytes_received} bytes in {total_time:.2f}s, speed={speed:.2f} B/s{RESET}")
+                return
+
+            except Exception as e:
+                retries -= 1
+                if retries > 0:
+                    time.sleep(1)
+                print(f"\n{RED}[TCP-{t_id}] Error: {e}, retries left: {retries}{RESET}")
+            finally:
+                tcp_socket.close()
+
+    def udp_test(t_id):
         """
-        Simple text progress bar or partial progress, for demonstration.
+        Fixed UDP test client function
         """
-        bar_length = 20
-        fraction = current / total if total > 0 else 1
-        filled = int(bar_length * fraction)
-        bar = '#' * filled + '-' * (bar_length - filled)
-        print(f"{CYAN}[{identifier}] [{bar}] {current}/{total}{RESET}", end='\r')
+        retries = 3
+        while retries > 0 and not client_shutdown_event.is_set():
+            udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # Set buffer size
+                udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                udp_socket.settimeout(1)  # Shorter timeout
+                thread_num = int(t_id[1:])  # Extract number from thread ID
 
-    def tcp_test(thread_id):
-        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        start_time = time.time()
+                # Fix packet format to match server
+                request_msg = struct.pack('!IBQQ',
+                                          OFFER_MAGIC_COOKIE,
+                                          REQUEST_MESSAGE_TYPE,
+                                          file_size,
+                                          thread_num)
 
-        # We'll read data in chunks to show partial progress
-        chunk_size = 1024
-        bytes_received = 0
-        data_buf = b""
+                start_time = time.time()
+                udp_socket.sendto(request_msg, (server_ip, server_udp_port))
 
-        try:
-            tcp_socket.settimeout(5)  # fail if 5s no response
-            tcp_socket.connect((server_ip, server_tcp_port))
-            tcp_socket.sendall(f"{file_size}\n".encode())
+                packets = {}
+                arrival_times = []
+                received_packets = 0
+                last_update_time = time.time()
+                no_data_count = 0
+                max_no_data = 5
 
-            # Keep receiving until we have 'file_size' bytes
-            while bytes_received < file_size:
-                chunk = tcp_socket.recv(chunk_size)
-                if not chunk:
-                    break
-                data_buf += chunk
-                bytes_received += len(chunk)
+                while True:
+                    try:
+                        data, _ = udp_socket.recvfrom(2048)  # Increased buffer
 
-                # Update progress
-                with progress_lock:
-                    progress_dict[thread_id] = bytes_received
-                    print_progress(f"TCP-{thread_id}", bytes_received, file_size)
+                        # Fixed struct format to match server's response
+                        header_size = struct.calcsize('!IBQQ')
+                        if len(data) < header_size:
+                            continue
 
-            total_time = time.time() - start_time
-            speed = bytes_received / total_time if total_time > 0 else 0
-            print(f"\n{GREEN}[TCP-{thread_id}] Received {bytes_received} bytes in {total_time:.2f}s, speed={speed:.2f} B/s{RESET}")
+                        cookie, msg_type, total, seq = struct.unpack('!IBQQ', data[:header_size])
 
-        except Exception as e:
-            print(f"\n{RED}[TCP-{thread_id}] Error: {e}{RESET}")
-        finally:
-            tcp_socket.close()
+                        if cookie != OFFER_MAGIC_COOKIE or msg_type != PAYLOAD_MESSAGE_TYPE:
+                            continue
 
-    def udp_test(thread_id):
-        """
-        For UDP, we measure how many packets arrive, plus a naive "jitter" calculation:
-        Jitter = average of absolute differences between consecutive packet arrival times.
-        """
-        udp_socket_local = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_socket_local.settimeout(5)
+                        if seq not in packets:
+                            packets[seq] = True
+                            received_packets += 1
+                            arrival_times.append(time.time())
+                            no_data_count = 0
 
-        request_msg = struct.pack('!IBQ', OFFER_MAGIC_COOKIE, REQUEST_MESSAGE_TYPE, file_size)
-        start_time = time.time()
+                        if time.time() - last_update_time >= 0.1:
+                            with progress_lock:
+                                progress_dict[t_id] = received_packets
+                                expected_packets = file_size // 1024
+                                print_progress(f"UDP-{t_id}", received_packets, expected_packets)
+                            last_update_time = time.time()
 
-        arrival_times = []
-        received_packets = 0
-        try:
-            # Send request to server
-            udp_socket_local.sendto(request_msg, (server_ip, server_udp_port))
+                        if received_packets >= total:
+                            break
 
-            while True:
-                try:
-                    data, _ = udp_socket_local.recvfrom(2048)
-                except socket.timeout:
-                    # If no data for 5s, we assume we're done
-                    break
-                arrival_times.append(time.time())
-                received_packets += 1
+                    except socket.timeout:
+                        no_data_count += 1
+                        if no_data_count > max_no_data:
+                            break
+                        continue
 
-                # Update partial progress (just the packet count)
-                with progress_lock:
-                    progress_dict[thread_id] = received_packets
-                    expected_packets = file_size // 1024
-                    print_progress(f"UDP-{thread_id}", received_packets, expected_packets)
+                total_time = time.time() - start_time
+                expected_packets = file_size // 1024
+                lost_packets = expected_packets - received_packets
 
-            total_time = time.time() - start_time
-            expected_packets = file_size // 1024
-            lost_packets = expected_packets - received_packets
-
-            # Calculate simple jitter
-            # Jitter = average of absolute differences between consecutive arrival times
-            if len(arrival_times) > 1:
-                deltas = []
-                for i in range(1, len(arrival_times)):
-                    deltas.append(abs(arrival_times[i] - arrival_times[i - 1]))
-                jitter = sum(deltas) / len(deltas)
-            else:
                 jitter = 0.0
+                if len(arrival_times) > 1:
+                    deltas = [abs(arrival_times[i] - arrival_times[i - 1]) for i in range(1, len(arrival_times))]
+                    jitter = sum(deltas) / len(deltas) if deltas else 0
 
-            # Speed in bytes/s
-            # We assume each packet is 1024 bytes of payload
-            speed = (received_packets * 1024) / total_time if total_time > 0 else 0
+                speed = (received_packets * 1024) / total_time if total_time > 0 else 0
 
-            print(f"\n{GREEN}[UDP-{thread_id}] Received {received_packets}/{expected_packets} packets in {total_time:.2f}s "
-                  f"(loss={lost_packets}, jitter={jitter:.4f}s), speed={speed:.2f} B/s{RESET}")
+                print(f"\n{GREEN}[UDP-{t_id}] Received {received_packets}/{expected_packets} packets "
+                      f"(loss={lost_packets}, jitter={jitter:.4f}s), speed={speed:.2f} B/s{RESET}")
+                return
 
-        except Exception as e:
-            print(f"\n{RED}[UDP-{thread_id}] Error: {e}{RESET}")
-        finally:
-            udp_socket_local.close()
+            except Exception as e:
+                retries -= 1
+                if retries > 0:
+                    time.sleep(1)
+                print(f"\n{RED}[UDP-{t_id}] Error: {e}, retries left: {retries}{RESET}")
+            finally:
+                try:
+                    udp_socket.close()
+                except:
+                    pass
 
-    # Start threads
     threads = []
-    # We'll label them 1..n for TCP, 1..n for UDP
     for i in range(tcp_connections):
-        thread_id = f"T{i+1}"
-        progress_dict[thread_id] = 0
-        t = threading.Thread(target=tcp_test, args=(thread_id,))
+        t_id = f"T{i + 1}"
+        progress_dict[t_id] = 0
+        t = threading.Thread(target=tcp_test, args=(t_id,))
         t.start()
         threads.append(t)
+        time.sleep(0.1)  # Stagger connection starts
 
     for i in range(udp_connections):
-        thread_id = f"U{i+1}"
-        progress_dict[thread_id] = 0
-        t = threading.Thread(target=udp_test, args=(thread_id,))
+        t_id = f"U{i + 1}"
+        progress_dict[t_id] = 0
+        t = threading.Thread(target=udp_test, args=(t_id,))
         t.start()
         threads.append(t)
+        time.sleep(0.1)  # Stagger connection starts
 
-    # Wait for all to finish
     for t in threads:
         t.join()
 
-    print(f"{CYAN}All transfers completed!\n{RESET}")
-
+    print(f"{GREEN}All transfers completed!{RESET}")
 
 def main():
     """
