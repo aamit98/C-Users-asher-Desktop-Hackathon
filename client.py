@@ -45,6 +45,8 @@ def udp_discover():
         udp_socket.settimeout(3)  # Wait up to 3 seconds for broadcast
         try:
             data, addr = udp_socket.recvfrom(1024)
+            print(f"Received raw data: {data} from {addr}")
+
         except socket.timeout:
             print(f"{YELLOW}No offers received yet... retrying.{RESET}")
             continue
@@ -54,6 +56,8 @@ def udp_discover():
 
         try:
             magic_cookie, msg_type, udp_port, tcp_port = struct.unpack('!IBHH', data)
+            print(
+                f"Parsed packet: magic_cookie={hex(magic_cookie)}, msg_type={msg_type}, udp_port={udp_port}, tcp_port={tcp_port}")
             if magic_cookie == OFFER_MAGIC_COOKIE and msg_type == OFFER_MESSAGE_TYPE:
                 print(f"{GREEN}Received offer from {addr[0]}:{RESET} UDP={udp_port}, TCP={tcp_port}")
                 udp_socket.close()

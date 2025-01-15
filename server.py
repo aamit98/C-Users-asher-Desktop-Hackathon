@@ -45,7 +45,7 @@ def udp_offer_broadcast():
 
     try:
         while not server_shutdown_event.is_set():
-            udp_socket.sendto(offer_message, ('<broadcast>', UDP_BROADCAST_PORT))
+            udp_socket.sendto(offer_message, ('172.20.10.15', UDP_BROADCAST_PORT))
             time.sleep(1)
     finally:
         udp_socket.close()
